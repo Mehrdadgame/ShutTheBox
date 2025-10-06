@@ -1,0 +1,39 @@
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: shutthetwelve-sql
+    environment:
+      - ACCEPT_EULA=Y
+      - SA_PASSWORD=YourStrong!Password123
+      - MSSQL_PID=Express
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver_data:/var/opt/mssql
+    networks:
+      - shutthetwelve-network
+
+  backend:
+    image: mcr.microsoft.com/dotnet/aspnet:8.0
+    container_name: shutthetwelve-backend
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:80
+      - ConnectionStrings__DefaultConnection=Server=sqlserver;Database=ShutTheTwelveDB;User Id=sa;Password=YourStrong!Password123;TrustServerCertificate=True;
+    ports:
+      - "8080:80"
+    depends_on:
+      - sqlserver
+    networks:
+      - shutthetwelve-network
+    volumes:
+      - ./bin/Release/net8.0/publish:/app
+    working_dir: /app
+    command: dotnet ShutTheTwelveBackend.dll
+
+volumes:
+  sqlserver_data:
+
+networks:
+  shutthetwelve-network:
+    driver: bridge
