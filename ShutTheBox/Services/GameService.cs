@@ -1,118 +1,123 @@
-﻿using Microsoft.EntityFrameworkCore;
-using ShutTheBox.DTOs;
-using ShutTheBox.Models;
-using ShutTheTwelve.Backend.Interfaces;
-using ShutTheTwelve.Backend.Models;
-using ShutTheTwelveBackend.Data;
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Security.Cryptography;
-using System.Text.Json;
+using System.Threading.Tasks;
+using Microsoft.EntityFrameworkCore;
+using ShutTheTwelveServer.Data;
+using ShutTheTwelveServer.DTOs;
+using ShutTheTwelveServer.Models;
 
-namespace ShutTheTwelve.Backend.Services
+namespace ShutTheTwelveServer.Services
 {
+    public interface IGameService
+    {
+        Task<GameSession> CreateGameSession(Guid player1Id, Guid? player2Id, string gameMode, bool isAgainstBot);
+        Task<DiceRollDTO> RollDice(Guid sessionId, Guid playerId);
+        Task<bool> MakeMove(Guid sessionId, Guid playerId, List<int> selectedNumbers);
+        Task<GameStateDTO> GetGameState(Guid sessionId, Guid playerId);
+        bool ValidateMove(List<int> board, List<int> selection, int dice1, int dice2);
+        List<int> GetBotMove(List<int> board, int dice1, int dice2, string difficulty);
+        Task EndGame(Guid sessionId, Guid? winnerId);
+        Task UpdateScores(Guid winnerId, Guid loserId, int winnerScore, int loserScore);
+    }
+
     public class GameService : IGameService
     {
         private readonly GameDbContext _context;
+        private readonly RandomNumberGenerator _rng;
 
         public GameService(GameDbContext context)
         {
             _context = context;
+            _rng = RandomNumberGenerator.Create();
         }
 
-        public async Task<GameSession> CreateGame(int player1Id, int? player2Id, string gameMode, bool isAI)
+        public async Task<GameSession> CreateGameSession(Guid player1Id, Guid? player2Id, string gameMode, bool isAgainstBot)
         {
-            var game = new GameSession
+            var session = new GameSession
             {
+                Id = Guid.NewGuid(),
                 Player1Id = player1Id,
                 Player2Id = player2Id,
-                IsAIGame = isAI,
+                IsAgainstBot = isAgainstBot,
                 GameMode = gameMode,
-                State = "InProgress",
-                ActiveTurn = "Player1",
-                Player1Board = "[1,2,3,4,5,6,7,8,9,10,11,12]",
-                Player2Board = "[1,2,3,4,5,6,7,8,9,10,11,12]",
-                Player1Cards = "[]",
-                Player2Cards = "[]",
+                State = GameSessionState.InProgress,
+                CurrentTurn = RandomBool() ? PlayerTurn.Player1 : PlayerTurn.Player2,
                 CreatedAt = DateTime.UtcNow,
-                CurrentRound = 1,
-                TotalRounds = gameMode == "Score" ? 10 : 1
+                StartedAt = DateTime.UtcNow
             };
 
-            _context.GameSessions.Add(game);
+            if (isAgainstBot)
+            {
+                session.BotDifficulty = "Medium"; // Can be configured
+            }
+
+            _context.GameSessions.Add(session);
             await _context.SaveChangesAsync();
 
-            return game;
+            return session;
         }
 
-        public async Task<GameSession?> GetGameById(int gameId)
+        public async Task<DiceRollDTO> RollDice(Guid sessionId, Guid playerId)
         {
-            return await _context.GameSessions
-                .Include(g => g.Player1)
-                .Include(g => g.Player2)
-                .FirstOrDefaultAsync(g => g.Id == gameId);
-        }
+            var session = await _context.GameSessions.FindAsync(sessionId);
+            if (session == null) throw new Exception("Session not found");
 
-        public async Task<DiceRollResult> RollDice(int gameId)
-        {
-            var game = await GetGameById(gameId);
-            if (game == null)
-                throw new Exception("Game not found");
+            // Check for active card effects
+            var cardUsages = await _context.PowerCardUsages
+                .Where(u => u.GameSessionId == sessionId && u.PlayerId == playerId)
+                .Include(u => u.PowerCard)
+                .ToListAsync();
 
-            // Secure server-side dice rolling
-            int die1 = RandomNumberGenerator.GetInt32(1, 7);
-            int die2 = RandomNumberGenerator.GetInt32(1, 7);
-
-            var diceRoll = new DiceRoll
+            var rollResult = new DiceRollDTO
             {
-                GameSessionId = gameId,
-                Roll1 = die1,
-                Roll2 = die2,
-                PlayerTurn = game.ActiveTurn,
-                Timestamp = DateTime.UtcNow
+                Dice1 = SecureRandomInt(1, 7),
+                Dice2 = SecureRandomInt(1, 7)
             };
 
-            _context.DiceRolls.Add(diceRoll);
+            // Apply card effects
+            var sabotage = cardUsages.FirstOrDefault(u => u.PowerCard.Type == CardType.Sabotage);
+            if (sabotage != null)
+            {
+                rollResult.IsSabotaged = true;
+                rollResult.Dice1 = SecureRandomInt(1, 4);
+            }
+
+            var wildDice = cardUsages.FirstOrDefault(u => u.PowerCard.Type == CardType.WildDice);
+            if (wildDice != null)
+            {
+                rollResult.WildDieValue = SecureRandomInt(5, 7);
+                if (RandomBool())
+                    rollResult.Dice1 = rollResult.WildDieValue.Value;
+                else
+                    rollResult.Dice2 = rollResult.WildDieValue.Value;
+            }
+
+            // Save dice roll to session
+            session.LastDice1 = rollResult.Dice1;
+            session.LastDice2 = rollResult.Dice2;
             await _context.SaveChangesAsync();
 
-            return new DiceRollResult
-            {
-                Die1 = die1,
-                Die2 = die2,
-                PlayerTurn = game.ActiveTurn
-            };
+            return rollResult;
         }
 
-        public async Task<bool> MakeMove(int gameId, int playerId, List<int> selectedNumbers)
+        public async Task<bool> MakeMove(Guid sessionId, Guid playerId, List<int> selectedNumbers)
         {
-            var game = await GetGameById(gameId);
-            if (game == null) return false;
+            var session = await _context.GameSessions
+                .Include(s => s.Player1)
+                .Include(s => s.Player2)
+                .FirstOrDefaultAsync(s => s.Id == sessionId);
 
-            // Get last dice roll
-            var lastRoll = await _context.DiceRolls
-                .Where(d => d.GameSessionId == gameId)
-                .OrderByDescending(d => d.Timestamp)
-                .FirstOrDefaultAsync();
+            if (session == null) return false;
 
-            if (lastRoll == null) return false;
-
-            // Determine which board to update
-            List<int> board;
-            string boardJson;
-
-            if (game.Player1Id == playerId && game.ActiveTurn == "Player1")
-            {
-                board = JsonSerializer.Deserialize<List<int>>(game.Player1Board) ?? new List<int>();
-            }
-            else if (game.Player2Id == playerId && game.ActiveTurn == "Player2")
-            {
-                board = JsonSerializer.Deserialize<List<int>>(game.Player2Board) ?? new List<int>();
-            }
-            else
-            {
-                return false; // Not player's turn
-            }
+            // Determine which board to use
+            bool isPlayer1 = session.Player1Id == playerId;
+            var boardStr = isPlayer1 ? session.Player1Board : session.Player2Board;
+            var board = boardStr.Split(',').Select(int.Parse).ToList();
 
             // Validate move
-            if (!ValidateMove(board, selectedNumbers, lastRoll.Roll1, lastRoll.Roll2))
+            if (!ValidateMove(board, selectedNumbers, session.LastDice1, session.LastDice2))
                 return false;
 
             // Remove selected numbers from board
@@ -121,272 +126,274 @@ namespace ShutTheTwelve.Backend.Services
                 board.Remove(num);
             }
 
-            boardJson = JsonSerializer.Serialize(board);
-
-            // Update game state
-            if (game.Player1Id == playerId)
-            {
-                game.Player1Board = boardJson;
-            }
+            // Update board
+            if (isPlayer1)
+                session.Player1Board = string.Join(",", board);
             else
+                session.Player2Board = string.Join(",", board);
+
+            // Record move
+            var move = new GameMove
             {
-                game.Player2Board = boardJson;
-            }
+                Id = Guid.NewGuid(),
+                GameSessionId = sessionId,
+                PlayerId = playerId,
+                Dice1 = session.LastDice1,
+                Dice2 = session.LastDice2,
+                NumbersUsed = string.Join(",", selectedNumbers),
+                BoardStateBefore = boardStr,
+                BoardStateAfter = string.Join(",", board),
+                Timestamp = DateTime.UtcNow
+            };
+
+            _context.GameMoves.Add(move);
 
             // Check for winner
             if (board.Count == 0)
             {
-                game.State = "Finished";
-                game.WinnerId = playerId;
-                game.FinishedAt = DateTime.UtcNow;
-
-                // Update player stats
-                var winner = await _context.Players.FindAsync(playerId);
-                if (winner != null)
-                {
-                    winner.Wins++;
-                }
-
-                if (!game.IsAIGame && game.Player2Id.HasValue)
-                {
-                    var loser = await _context.Players.FindAsync(
-                        playerId == game.Player1Id ? game.Player2Id.Value : game.Player1Id);
-                    if (loser != null)
-                    {
-                        loser.Losses++;
-                    }
-                }
+                await EndGame(sessionId, playerId);
+            }
+            else
+            {
+                // Switch turn
+                session.CurrentTurn = session.CurrentTurn == PlayerTurn.Player1
+                    ? PlayerTurn.Player2
+                    : PlayerTurn.Player1;
             }
 
             await _context.SaveChangesAsync();
             return true;
         }
 
-        public async Task<bool> EndTurn(int gameId)
+        public async Task<GameStateDTO> GetGameState(Guid sessionId, Guid playerId)
         {
-            var game = await GetGameById(gameId);
-            if (game == null) return false;
+            var session = await _context.GameSessions
+                .Include(s => s.Player1)
+                .Include(s => s.Player2)
+                .FirstOrDefaultAsync(s => s.Id == sessionId);
 
-            // Switch turn
-            game.ActiveTurn = game.ActiveTurn == "Player1" ? "Player2" : "Player1";
+            if (session == null) return null;
 
-            await _context.SaveChangesAsync();
-            return true;
-        }
+            bool isPlayer1 = session.Player1Id == playerId;
 
-        public async Task<GameStateDto> GetGameState(int gameId)
-        {
-            var game = await GetGameById(gameId);
-            if (game == null)
-                throw new Exception("Game not found");
-
-            return new GameStateDto
+            return new GameStateDTO
             {
-                GameId = game.Id,
-                GameMode = game.GameMode,
-                State = game.State,
-                ActiveTurn = game.ActiveTurn,
-                IsAIGame = game.IsAIGame,
-                Player1Board = JsonSerializer.Deserialize<List<int>>(game.Player1Board) ?? new(),
-                Player2Board = JsonSerializer.Deserialize<List<int>>(game.Player2Board) ?? new(),
-                Player1Cards = JsonSerializer.Deserialize<List<string>>(game.Player1Cards) ?? new(),
-                Player2Cards = JsonSerializer.Deserialize<List<string>>(game.Player2Cards) ?? new(),
-                Player1Score = game.Player1Score,
-                Player2Score = game.Player2Score,
-                CurrentRound = game.CurrentRound,
-                TotalRounds = game.TotalRounds,
-                WinnerId = game.WinnerId
+                SessionId = session.Id,
+                GameMode = session.GameMode,
+                CurrentTurn = session.CurrentTurn.ToString(),
+                PlayerBoard = session.Player1Board.Split(',').Select(int.Parse).ToList(),
+                OpponentBoard = session.Player2Board.Split(',').Select(int.Parse).ToList(),
+                LastDice1 = session.LastDice1,
+                LastDice2 = session.LastDice2,
+                PlayerScore = isPlayer1 ? session.Player1Score : session.Player2Score,
+                OpponentScore = isPlayer1 ? session.Player2Score : session.Player1Score,
+                CurrentRound = session.CurrentRound,
+                IsAgainstBot = session.IsAgainstBot,
+                OpponentName = isPlayer1
+                    ? (session.IsAgainstBot ? "Bot" : session.Player2?.Username)
+                    : session.Player1?.Username
             };
         }
 
-        public async Task<bool> UseCard(int gameId, int playerId, string cardType, int? targetDie = null)
-        {
-            var game = await GetGameById(gameId);
-            if (game == null) return false;
-
-            // بررسی نوبت
-            bool isPlayer1 = game.Player1Id == playerId;
-            string expectedTurn = isPlayer1 ? "Player1" : "Player2";
-
-            // دریافت آخرین تاس
-            var lastRoll = await _context.DiceRolls
-                .Where(d => d.GameSessionId == gameId)
-                .OrderByDescending(d => d.Timestamp)
-                .FirstOrDefaultAsync();
-
-            // پیاده‌سازی کارت‌ها
-            switch (cardType.ToLower())
-            {
-                case "lockreroll":
-                case "lockandreroll":
-                    // قفل یک تاس و reroll تاس دیگر
-                    if (lastRoll == null || targetDie == null) return false;
-
-                    int newDie = RandomNumberGenerator.GetInt32(1, 7);
-                    if (targetDie == 1)
-                        lastRoll.Roll2 = newDie;
-                    else
-                        lastRoll.Roll1 = newDie;
-
-                    await _context.SaveChangesAsync();
-                    break;
-
-                case "sabotage":
-                    // خرابکاری - تاس حریف 1-3 می‌شود
-                    // این باید در RollDice بعدی اعمال شود
-                    // ذخیره در یک فیلد موقت
-                    if (isPlayer1)
-                        game.Player2Cards = game.Player2Cards + "|SABOTAGED:" + (targetDie ?? 1);
-                    else
-                        game.Player1Cards = game.Player1Cards + "|SABOTAGED:" + (targetDie ?? 1);
-
-                    await _context.SaveChangesAsync();
-                    break;
-
-                case "secondchance":
-                    // شانس دوم - reroll کامل
-                    if (lastRoll != null)
-                    {
-                        lastRoll.Roll1 = RandomNumberGenerator.GetInt32(1, 7);
-                        lastRoll.Roll2 = RandomNumberGenerator.GetInt32(1, 7);
-                        await _context.SaveChangesAsync();
-                    }
-                    break;
-
-                case "wilddie":
-                case "wilddice":
-                    // تنظیم یک تاس به عدد دلخواه
-                    if (lastRoll == null || targetDie == null) return false;
-
-                    int wildValue = RandomNumberGenerator.GetInt32(5, 7); // 5 یا 6
-                    if (targetDie == 1)
-                        lastRoll.Roll1 = wildValue;
-                    else
-                        lastRoll.Roll2 = wildValue;
-
-                    await _context.SaveChangesAsync();
-                    break;
-
-                case "stealturn":
-                    // دزدیدن نوبت - تغییر نوبت به سود بازیکن
-                    game.ActiveTurn = expectedTurn;
-                    await _context.SaveChangesAsync();
-                    break;
-
-                case "shield":
-                    // سپر - خنثی کردن کارت تهاجمی
-                    // این باید reactive باشد
-                    break;
-
-                case "lightningroll":
-                    // 3 بار تاس انداختن و انتخاب بهترین
-                    var roll1 = (RandomNumberGenerator.GetInt32(1, 7), RandomNumberGenerator.GetInt32(1, 7));
-                    var roll2 = (RandomNumberGenerator.GetInt32(1, 7), RandomNumberGenerator.GetInt32(1, 7));
-                    var roll3 = (RandomNumberGenerator.GetInt32(1, 7), RandomNumberGenerator.GetInt32(1, 7));
-
-                    var bestRoll = new[] { roll1, roll2, roll3 }
-                        .OrderByDescending(r => r.Item1 + r.Item2)
-                        .First();
-
-                    if (lastRoll != null)
-                    {
-                        lastRoll.Roll1 = bestRoll.Item1;
-                        lastRoll.Roll2 = bestRoll.Item2;
-                        await _context.SaveChangesAsync();
-                    }
-                    break;
-
-                case "swapboard":
-                    // تعویض یک عدد با حریف
-                    var playerBoard = isPlayer1 ?
-                        JsonSerializer.Deserialize<List<int>>(game.Player1Board) :
-                        JsonSerializer.Deserialize<List<int>>(game.Player2Board);
-                    var opponentBoard = isPlayer1 ?
-                        JsonSerializer.Deserialize<List<int>>(game.Player2Board) :
-                        JsonSerializer.Deserialize<List<int>>(game.Player1Board);
-
-                    if (playerBoard.Count > 0 && opponentBoard.Count > 0)
-                    {
-                        int playerNum = playerBoard[RandomNumberGenerator.GetInt32(0, playerBoard.Count)];
-                        int opponentNum = opponentBoard[RandomNumberGenerator.GetInt32(0, opponentBoard.Count)];
-
-                        playerBoard.Remove(playerNum);
-                        opponentBoard.Remove(opponentNum);
-                        playerBoard.Add(opponentNum);
-                        opponentBoard.Add(playerNum);
-
-                        if (isPlayer1)
-                        {
-                            game.Player1Board = JsonSerializer.Serialize(playerBoard);
-                            game.Player2Board = JsonSerializer.Serialize(opponentBoard);
-                        }
-                        else
-                        {
-                            game.Player2Board = JsonSerializer.Serialize(playerBoard);
-                            game.Player1Board = JsonSerializer.Serialize(opponentBoard);
-                        }
-
-                        await _context.SaveChangesAsync();
-                    }
-                    break;
-
-                case "mimic":
-                    // تقلید - کپی کردن آخرین کارت حریف
-                    // نیاز به ذخیره تاریخچه کارت‌ها
-                    break;
-            }
-
-            return true;
-        }
-
-        public bool ValidateMove(List<int> board, List<int> selection, int die1, int die2)
+        public bool ValidateMove(List<int> board, List<int> selection, int dice1, int dice2)
         {
             if (selection == null || selection.Count == 0) return false;
 
-            // Check all selected numbers exist on board
+            // Check all selected numbers are on board
             foreach (var num in selection)
             {
                 if (!board.Contains(num)) return false;
             }
 
             int sum = selection.Sum();
-            int diceSum = die1 + die2;
+            int diceSum = dice1 + dice2;
 
-            // Valid if sum equals die1, die2, or die1+die2
-            return sum == die1 || sum == die2 || sum == diceSum;
+            // Valid combinations
+            return sum == dice1 || sum == dice2 || sum == diceSum;
         }
 
-        public bool HasPossibleMoves(List<int> board, int die1, int die2)
+        public List<int> GetBotMove(List<int> board, int dice1, int dice2, string difficulty)
         {
-            if (board.Count == 0) return false;
+            var possibleMoves = new List<List<int>>();
+            int diceSum = dice1 + dice2;
 
-            int sum = die1 + die2;
+            // Single die moves
+            if (board.Contains(dice1))
+                possibleMoves.Add(new List<int> { dice1 });
+            if (board.Contains(dice2))
+                possibleMoves.Add(new List<int> { dice2 });
 
-            // Check if any subset sums to die1, die2, or sum
-            return ExistsSubsetSum(board, die1) ||
-                   ExistsSubsetSum(board, die2) ||
-                   (sum <= 12 && ExistsSubsetSum(board, sum));
-        }
+            // Sum move
+            if (diceSum <= 12 && board.Contains(diceSum))
+                possibleMoves.Add(new List<int> { diceSum });
 
-        private bool ExistsSubsetSum(List<int> board, int target)
-        {
-            if (target <= 0 || target > 12) return false;
-
-            int n = Math.Min(board.Count, 12);
-            int maxMask = 1 << n;
-
-            for (int mask = 1; mask < maxMask; mask++)
+            // Two number combinations for dice values
+            for (int i = 1; i < dice1; i++)
             {
-                int sum = 0;
-                for (int i = 0; i < n; i++)
-                {
-                    if ((mask & (1 << i)) != 0)
-                        sum += board[i];
-                }
-                if (sum == target) return true;
+                if (board.Contains(i) && board.Contains(dice1 - i))
+                    possibleMoves.Add(new List<int> { i, dice1 - i });
             }
 
-            return false;
+            for (int i = 1; i < dice2; i++)
+            {
+                if (board.Contains(i) && board.Contains(dice2 - i))
+                    possibleMoves.Add(new List<int> { i, dice2 - i });
+            }
+
+            // Two number combinations for sum
+            for (int i = 1; i < diceSum; i++)
+            {
+                if (board.Contains(i) && board.Contains(diceSum - i))
+                    possibleMoves.Add(new List<int> { i, diceSum - i });
+            }
+
+            if (possibleMoves.Count == 0)
+                return new List<int>();
+
+            // Bot difficulty logic
+            switch (difficulty)
+            {
+                case "Easy":
+                    // Random move
+                    return possibleMoves[SecureRandomInt(0, possibleMoves.Count)];
+
+                case "Hard":
+                    // Prefer moves that clear more numbers
+                    return possibleMoves.OrderByDescending(m => m.Count).First();
+
+                default: // Medium
+                    // Prefer larger numbers
+                    return possibleMoves.OrderByDescending(m => m.Sum()).First();
+            }
+        }
+
+        public async Task EndGame(Guid sessionId, Guid? winnerId)
+        {
+            var session = await _context.GameSessions.FindAsync(sessionId);
+            if (session == null) return;
+
+            session.State = GameSessionState.Completed;
+            session.EndedAt = DateTime.UtcNow;
+            session.WinnerId = winnerId;
+
+            if (winnerId.HasValue)
+            {
+                var loserId = winnerId == session.Player1Id ? session.Player2Id : session.Player1Id;
+
+                if (loserId.HasValue) // Not a bot
+                {
+                    await UpdateScores(winnerId.Value, loserId.Value,
+                        session.Player1Score, session.Player2Score);
+                }
+                else if (session.Player1Id.HasValue) // Against bot
+                {
+                    await UpdateScoresAgainstBot(session.Player1Id.Value,
+                        winnerId == session.Player1Id);
+                }
+            }
+
+            await _context.SaveChangesAsync();
+        }
+
+        public async Task UpdateScores(Guid winnerId, Guid loserId, int winnerScore, int loserScore)
+        {
+            var winner = await _context.Players.FindAsync(winnerId);
+            var loser = await _context.Players.FindAsync(loserId);
+
+            if (winner != null)
+            {
+                winner.TotalWins++;
+                winner.CurrentStreak++;
+                winner.BestStreak = Math.Max(winner.BestStreak, winner.CurrentStreak);
+
+                // Calculate score based on performance
+                int scoreGain = CalculateScore(true, winnerScore, loserScore);
+                winner.TotalScore += scoreGain;
+                winner.WeeklyScore += scoreGain;
+                winner.MonthlyScore += scoreGain;
+
+                // Experience
+                winner.Experience += 100;
+                CheckLevelUp(winner);
+            }
+
+            if (loser != null)
+            {
+                loser.TotalLosses++;
+                loser.CurrentStreak = 0;
+
+                int scoreGain = CalculateScore(false, loserScore, winnerScore);
+                loser.TotalScore += scoreGain;
+                loser.WeeklyScore += scoreGain;
+                loser.MonthlyScore += scoreGain;
+
+                loser.Experience += 25;
+                CheckLevelUp(loser);
+            }
+
+            await _context.SaveChangesAsync();
+        }
+
+        private async Task UpdateScoresAgainstBot(Guid playerId, bool won)
+        {
+            var player = await _context.Players.FindAsync(playerId);
+            if (player == null) return;
+
+            if (won)
+            {
+                player.TotalWins++;
+                player.CurrentStreak++;
+                player.BestStreak = Math.Max(player.BestStreak, player.CurrentStreak);
+
+                int scoreGain = 50; // Base score for bot win
+                player.TotalScore += scoreGain;
+                player.WeeklyScore += scoreGain;
+                player.MonthlyScore += scoreGain;
+
+                player.Experience += 50;
+            }
+            else
+            {
+                player.TotalLosses++;
+                player.CurrentStreak = 0;
+                player.Experience += 10;
+            }
+
+            CheckLevelUp(player);
+            await _context.SaveChangesAsync();
+        }
+
+        private int CalculateScore(bool won, int myScore, int opponentScore)
+        {
+            int baseScore = won ? 100 : 10;
+            int scoreDiff = Math.Abs(myScore - opponentScore);
+            int bonus = scoreDiff * 2;
+
+            return baseScore + bonus;
+        }
+
+        private void CheckLevelUp(Player player)
+        {
+            int requiredExp = player.Level * 200;
+            while (player.Experience >= requiredExp)
+            {
+                player.Experience -= requiredExp;
+                player.Level++;
+                requiredExp = player.Level * 200;
+            }
+        }
+
+        private int SecureRandomInt(int min, int max)
+        {
+            byte[] bytes = new byte[4];
+            _rng.GetBytes(bytes);
+            int value = BitConverter.ToInt32(bytes, 0);
+            return Math.Abs(value % (max - min)) + min;
+        }
+
+        private bool RandomBool()
+        {
+            return SecureRandomInt(0, 2) == 0;
         }
     }
 }

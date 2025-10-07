@@ -1,12 +1,11 @@
-﻿using Microsoft.AspNetCore.Authorization;
+﻿using System;
+using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
-using ShutTheBox.DTOs;
-using ShutTheBox.Models;
-using ShutTheTwelve.Backend.Interfaces;
+using ShutTheTwelveServer.DTOs;
+using ShutTheTwelveServer.Services;
 
-namespace ShutTheTwelve.Backend.Controllers
+namespace ShutTheTwelveServer.Controllers
 {
-
     [ApiController]
     [Route("api/[controller]")]
     public class AuthController : ControllerBase
@@ -19,73 +18,42 @@ namespace ShutTheTwelve.Backend.Controllers
         }
 
         [HttpPost("register")]
-        public async Task<ActionResult<AuthResponse>> Register([FromBody] RegisterRequest request)
+        public async Task<IActionResult> Register([FromBody] RegisterDTO dto)
         {
-            if (!ModelState.IsValid)
+            try
             {
-                return BadRequest(new AuthResponse
-                {
-                    Success = false,
-                    Message = "Invalid request data"
-                });
+                var response = await _authService.Register(dto);
+                return Ok(response);
             }
-
-            var result = await _authService.Register(request);
-
-            if (!result.Success)
-                return BadRequest(result);
-
-            return Ok(result);
+            catch (Exception ex)
+            {
+                return BadRequest(new { error = ex.Message });
+            }
         }
 
         [HttpPost("login")]
-        public async Task<ActionResult<AuthResponse>> Login([FromBody] LoginRequest request)
+        public async Task<IActionResult> Login([FromBody] LoginDTO dto)
         {
-            if (!ModelState.IsValid)
+            try
             {
-                return BadRequest(new AuthResponse
-                {
-                    Success = false,
-                    Message = "Invalid request data"
-                });
+                var response = await _authService.Login(dto);
+                return Ok(response);
             }
-
-            var result = await _authService.Login(request);
-
-            if (!result.Success)
-                return Unauthorized(result);
-
-            return Ok(result);
+            catch (Exception ex)
+            {
+                return Unauthorized(new { error = ex.Message });
+            }
         }
 
-        [Authorize]
-        [HttpGet("profile")]
-        public async Task<ActionResult<PlayerDto>> GetProfile()
+        [HttpGet("version")]
+        public IActionResult CheckVersion([FromQuery] string clientVersion)
         {
-            var userIdClaim = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier);
-            if (userIdClaim == null || !int.TryParse(userIdClaim.Value, out int userId))
+            var isValid = _authService.CheckVersion(clientVersion);
+            return Ok(new
             {
-                return Unauthorized();
-            }
-
-            var player = await _authService.GetPlayerById(userId);
-            if (player == null)
-                return NotFound();
-
-            return Ok(new PlayerDto
-            {
-                Id = player.Id,
-                Username = player.Username,
-                Power = player.Power,
-                Wins = player.Wins,
-                Losses = player.Losses
+                requiresUpdate = !isValid,
+                currentVersion = "1.0.0"
             });
-        }
-
-        [HttpGet("health")]
-        public IActionResult HealthCheck()
-        {
-            return Ok(new { status = "Server is running", timestamp = DateTime.UtcNow });
         }
     }
 }

@@ -1,18 +1,16 @@
-﻿using ShutTheTwelveBackend.Models;
+﻿using System;
 
-namespace ShutTheTwelve.Backend.Models
+namespace ShutTheTwelveServer.Models
 {
     public class PlayerCard
     {
-        public string Id { get; set; } = Guid.NewGuid().ToString();
-
-        public string PlayerId { get; set; }
+        public Guid PlayerId { get; set; }
         public virtual Player Player { get; set; }
 
-        public string CardId { get; set; }
-        public virtual PowerCard Card { get; set; }
+        public int PowerCardId { get; set; }
+        public virtual PowerCard PowerCard { get; set; }
 
-        public bool Used { get; set; } = false;
-        public DateTime? UsedAt { get; set; }
+        public int Quantity { get; set; } = 1;
+        public DateTime UnlockedAt { get; set; } = DateTime.UtcNow;
     }
 }

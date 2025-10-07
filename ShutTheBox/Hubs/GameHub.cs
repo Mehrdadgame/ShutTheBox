@@ -1,83 +1,160 @@
-﻿using Microsoft.AspNetCore.Authorization;
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
-using ShutTheTwelve.Backend.Enums;
-using ShutTheTwelve.Backend.Interfaces;
-using System.Security.Claims;
+using Microsoft.EntityFrameworkCore;
+using ShutTheTwelveServer.Data;
+using ShutTheTwelveServer.DTOs;
+using ShutTheTwelveServer.Models;
+using ShutTheTwelveServer.Services;
 
-namespace ShutTheTwelve.Backend.Hubs
+namespace ShutTheTwelveServer.Hubs
 {
     [Authorize]
     public class GameHub : Hub
     {
+        private readonly GameDbContext _context;
         private readonly IGameService _gameService;
-        private readonly IBotService _botService;
-        private static readonly Dictionary<int, string> _playerConnections = new();
+        private readonly IMatchmakingService _matchmakingService;
+        private readonly ILeaderboardService _leaderboardService;
+        private static readonly Dictionary<string, Guid> _connections = new();
 
-        public GameHub(IGameService gameService, IBotService botService)
+        public GameHub(
+            GameDbContext context,
+            IGameService gameService,
+            IMatchmakingService matchmakingService,
+            ILeaderboardService leaderboardService)
         {
+            _context = context;
             _gameService = gameService;
-            _botService = botService;
-        }
-
-        private int GetUserId()
-        {
-            var userIdClaim = Context.User?.FindFirst(ClaimTypes.NameIdentifier);
-            return userIdClaim != null ? int.Parse(userIdClaim.Value) : 0;
+            _matchmakingService = matchmakingService;
+            _leaderboardService = leaderboardService;
         }
 
         public override async Task OnConnectedAsync()
         {
-            int userId = GetUserId();
-            if (userId > 0)
+            var playerId = GetPlayerId();
+            if (playerId.HasValue)
             {
-                _playerConnections[userId] = Context.ConnectionId;
+                _connections[Context.ConnectionId] = playerId.Value;
+
+                var player = await _context.Players.FindAsync(playerId.Value);
+                if (player != null)
+                {
+                    player.IsOnline = true;
+                    player.ConnectionId = Context.ConnectionId;
+                    await _context.SaveChangesAsync();
+                }
+
+                await Groups.AddToGroupAsync(Context.ConnectionId, playerId.Value.ToString());
             }
+
             await base.OnConnectedAsync();
         }
 
-        public override async Task OnDisconnectedAsync(Exception? exception)
+        public override async Task OnDisconnectedAsync(Exception exception)
         {
-            int userId = GetUserId();
-            _playerConnections.Remove(userId);
+            if (_connections.TryGetValue(Context.ConnectionId, out var playerId))
+            {
+                _connections.Remove(Context.ConnectionId);
+
+                var player = await _context.Players.FindAsync(playerId);
+                if (player != null)
+                {
+                    player.IsOnline = false;
+                    player.ConnectionId = null;
+                    await _context.SaveChangesAsync();
+                }
+
+                _matchmakingService.CancelMatchmaking(playerId);
+                await Groups.RemoveFromGroupAsync(Context.ConnectionId, playerId.ToString());
+            }
+
             await base.OnDisconnectedAsync(exception);
         }
 
-        public async Task JoinGame(int gameId)
+        public async Task FindMatch(MatchmakingRequestDTO request)
         {
-            await Groups.AddToGroupAsync(Context.ConnectionId, $"Game_{gameId}");
+            var playerId = GetPlayerId();
+            if (!playerId.HasValue) return;
 
-            var gameState = await _gameService.GetGameState(gameId);
+            var player = await _context.Players.FindAsync(playerId.Value);
+            if (player == null) return;
+
+            var matchRequest = new MatchmakingRequest
+            {
+                PlayerId = playerId.Value,
+                ConnectionId = Context.ConnectionId,
+                GameMode = request.GameMode,
+                SelectedCards = request.SelectedCards,
+                RequestTime = DateTime.UtcNow,
+                Rating = player.TotalScore
+            };
+
+            var sessionId = await _matchmakingService.FindMatch(matchRequest);
+
+            if (sessionId.HasValue)
+            {
+                await Groups.AddToGroupAsync(Context.ConnectionId, sessionId.Value.ToString());
+            }
+            else
+            {
+                await Clients.Caller.SendAsync("SearchingForMatch");
+            }
+        }
+
+        public async Task CancelMatchmaking()
+        {
+            var playerId = GetPlayerId();
+            if (!playerId.HasValue) return;
+
+            _matchmakingService.CancelMatchmaking(playerId.Value);
+            await Clients.Caller.SendAsync("MatchmakingCancelled");
+        }
+
+        public async Task JoinGame(Guid sessionId)
+        {
+            var playerId = GetPlayerId();
+            if (!playerId.HasValue) return;
+
+            var session = await _context.GameSessions
+                .Include(s => s.Player1)
+                .Include(s => s.Player2)
+                .FirstOrDefaultAsync(s => s.Id == sessionId);
+
+            if (session == null) return;
+
+            // Verify player is part of this session
+            if (session.Player1Id != playerId && session.Player2Id != playerId)
+                return;
+
+            await Groups.AddToGroupAsync(Context.ConnectionId, sessionId.ToString());
+
+            var gameState = await _gameService.GetGameState(sessionId, playerId.Value);
             await Clients.Caller.SendAsync("GameJoined", gameState);
-            await Clients.OthersInGroup($"Game_{gameId}").SendAsync("OpponentJoined", GetUserId());
+
+            // Notify opponent
+            var opponentId = session.Player1Id == playerId ? session.Player2Id : session.Player1Id;
+            if (opponentId.HasValue)
+            {
+                await Clients.Group(opponentId.Value.ToString())
+                    .SendAsync("OpponentJoined", playerId.Value);
+            }
         }
 
-        public async Task LeaveGame(int gameId)
+        public async Task RollDice(Guid sessionId)
         {
-            await Groups.RemoveFromGroupAsync(Context.ConnectionId, $"Game_{gameId}");
-            await Clients.OthersInGroup($"Game_{gameId}").SendAsync("OpponentLeft", GetUserId());
-        }
+            var playerId = GetPlayerId();
+            if (!playerId.HasValue) return;
 
-        public async Task RollDice(int gameId)
-        {
             try
             {
-                var result = await _gameService.RollDice(gameId);
+                var rollResult = await _gameService.RollDice(sessionId, playerId.Value);
 
-                // Send dice result to all players in the game
-                await Clients.Group($"Game_{gameId}").SendAsync("DiceRolled", new
-                {
-                    die1 = result.Die1,
-                    die2 = result.Die2,
-                    playerTurn = result.PlayerTurn
-                });
-
-                // Check if bot game and if it's bot's turn
-                var gameState = await _gameService.GetGameState(gameId);
-                if (gameState.IsAIGame && gameState.ActiveTurn == "Player2")
-                {
-                    await Task.Delay(1000); // Bot thinking time
-                    await ProcessBotTurn(gameId, result.Die1, result.Die2);
-                }
+                await Clients.Group(sessionId.ToString())
+                    .SendAsync("DiceRolled", rollResult, playerId.Value);
             }
             catch (Exception ex)
             {
@@ -85,66 +162,33 @@ namespace ShutTheTwelve.Backend.Hubs
             }
         }
 
-        public async Task MakeMove(int gameId, List<int> selectedNumbers)
+        public async Task MakeMove(MoveDTO move)
         {
+            var playerId = GetPlayerId();
+            if (!playerId.HasValue) return;
+
             try
             {
-                int playerId = GetUserId();
-                bool success = await _gameService.MakeMove(gameId, playerId, selectedNumbers);
+                var success = await _gameService.MakeMove(move.SessionId, playerId.Value, move.SelectedNumbers);
 
                 if (success)
                 {
-                    var gameState = await _gameService.GetGameState(gameId);
+                    var gameState = await _gameService.GetGameState(move.SessionId, playerId.Value);
 
-                    // Notify all players about the move
-                    await Clients.Group($"Game_{gameId}").SendAsync("MoveMade", new
+                    await Clients.Group(move.SessionId.ToString())
+                        .SendAsync("MoveMade", gameState, playerId.Value);
+
+                    // Check for game end
+                    var session = await _context.GameSessions.FindAsync(move.SessionId);
+                    if (session?.State == GameSessionState.Completed)
                     {
-                        playerId,
-                        selectedNumbers,
-                        gameState
-                    });
-
-                    // Check if game ended
-                    if (gameState.State == "Finished")
-                    {
-                        await Clients.Group($"Game_{gameId}").SendAsync("GameEnded", new
-                        {
-                            winnerId = gameState.WinnerId,
-                            gameState
-                        });
-                        return;
-                    }
-
-                    // End turn and switch to next player
-                    await _gameService.EndTurn(gameId);
-                    var updatedState = await _gameService.GetGameState(gameId);
-
-                    await Clients.Group($"Game_{gameId}").SendAsync("TurnChanged", new
-                    {
-                        activeTurn = updatedState.ActiveTurn,
-                        gameState = updatedState
-                    });
-
-                    // If bot game and now bot's turn, process bot move
-                    if (updatedState.IsAIGame && updatedState.ActiveTurn == "Player2")
-                    {
-                        await Task.Delay(1500); // Bot thinking
-                        var botRoll = await _gameService.RollDice(gameId);
-
-                        await Clients.Group($"Game_{gameId}").SendAsync("DiceRolled", new
-                        {
-                            die1 = botRoll.Die1,
-                            die2 = botRoll.Die2,
-                            playerTurn = "Player2"
-                        });
-
-                        await Task.Delay(1000);
-                        await ProcessBotTurn(gameId, botRoll.Die1, botRoll.Die2);
+                        await Clients.Group(move.SessionId.ToString())
+                            .SendAsync("GameEnded", session.WinnerId);
                     }
                 }
                 else
                 {
-                    await Clients.Caller.SendAsync("InvalidMove", "Invalid move selection");
+                    await Clients.Caller.SendAsync("InvalidMove");
                 }
             }
             catch (Exception ex)
@@ -153,103 +197,29 @@ namespace ShutTheTwelve.Backend.Hubs
             }
         }
 
-        private async Task ProcessBotTurn(int gameId, int die1, int die2)
+        public async Task UseCard(UseCardDTO cardData)
         {
+            var playerId = GetPlayerId();
+            if (!playerId.HasValue) return;
+
             try
             {
-                var gameState = await _gameService.GetGameState(gameId);
-                var botMove = await _botService.GetBotMove(gameState.Player2Board, die1, die2);
-
-                if (botMove.Count > 0)
+                // Record card usage
+                var cardUsage = new PowerCardUsage
                 {
-                    // Bot makes move (simulate as Player2)
-                    await Clients.Group($"Game_{gameId}").SendAsync("BotThinking", new
-                    {
-                        message = "AI is making a move..."
-                    });
+                    Id = Guid.NewGuid(),
+                    GameSessionId = cardData.SessionId,
+                    PlayerId = playerId.Value,
+                    PowerCardId = cardData.CardId,
+                    UsedAt = DateTime.UtcNow
+                };
 
-                    await Task.Delay(800);
+                _context.PowerCardUsages.Add(cardUsage);
+                await _context.SaveChangesAsync();
 
-                    // We need to manually update Player2's board since bot is not a real player
-                    var board = gameState.Player2Board.ToList();
-                    foreach (var num in botMove)
-                    {
-                        board.Remove(num);
-                    }
-
-                    await Clients.Group($"Game_{gameId}").SendAsync("MoveMade", new
-                    {
-                        playerId = 0, // Bot ID
-                        selectedNumbers = botMove,
-                        gameState
-                    });
-
-                    // Check for bot win
-                    if (board.Count == 0)
-                    {
-                        await Clients.Group($"Game_{gameId}").SendAsync("GameEnded", new
-                        {
-                            winnerId = (int?)null,
-                            message = "AI Won!",
-                            gameState
-                        });
-                        return;
-                    }
-
-                    // Switch back to player
-                    await _gameService.EndTurn(gameId);
-                    var updatedState = await _gameService.GetGameState(gameId);
-
-                    await Clients.Group($"Game_{gameId}").SendAsync("TurnChanged", new
-                    {
-                        activeTurn = "Player1",
-                        gameState = updatedState
-                    });
-                }
-                else
-                {
-                    // Bot has no moves
-                    await Clients.Group($"Game_{gameId}").SendAsync("BotNoMoves", new
-                    {
-                        message = "AI has no valid moves"
-                    });
-
-                    await _gameService.EndTurn(gameId);
-                    var updatedState = await _gameService.GetGameState(gameId);
-
-                    await Clients.Group($"Game_{gameId}").SendAsync("TurnChanged", new
-                    {
-                        activeTurn = "Player1",
-                        gameState = updatedState
-                    });
-                }
-            }
-            catch (Exception ex)
-            {
-                await Clients.Group($"Game_{gameId}").SendAsync("Error", ex.Message);
-            }
-        }
-
-        public async Task UseCard(int gameId, string cardType, int? targetDie)
-        {
-            try
-            {
-                int playerId = GetUserId();
-                bool success = await _gameService.UseCard(gameId, playerId, cardType, targetDie);
-
-                if (success)
-                {
-                    await Clients.Group($"Game_{gameId}").SendAsync("CardUsed", new
-                    {
-                        playerId,
-                        cardType,
-                        targetDie
-                    });
-                }
-                else
-                {
-                    await Clients.Caller.SendAsync("Error", "Failed to use card");
-                }
+                // Notify all players in game
+                await Clients.Group(cardData.SessionId.ToString())
+                    .SendAsync("CardUsed", cardData.CardId, playerId.Value, cardData.Parameters);
             }
             catch (Exception ex)
             {
@@ -257,20 +227,33 @@ namespace ShutTheTwelve.Backend.Hubs
             }
         }
 
-        public async Task SendMessage(int gameId, string message)
+        public async Task SendMessage(Guid sessionId, string message)
         {
+            var playerId = GetPlayerId();
+            if (!playerId.HasValue) return;
+
+            var player = await _context.Players.FindAsync(playerId.Value);
+            if (player == null) return;
+
+            await Clients.Group(sessionId.ToString())
+                .SendAsync("MessageReceived", player.Username, message);
+        }
+
+        public async Task GetLeaderboard(string type)
+        {
+            var playerId = GetPlayerId();
+            if (!playerId.HasValue) return;
+
             try
             {
-                int senderId = GetUserId();
-                var username = Context.User?.FindFirst(ClaimTypes.Name)?.Value ?? "Unknown";
+                LeaderboardDTO leaderboard;
 
-                await Clients.OthersInGroup($"Game_{gameId}").SendAsync("ReceiveMessage", new
-                {
-                    senderId,
-                    username,
-                    message,
-                    timestamp = DateTime.UtcNow
-                });
+                if (type == "Weekly")
+                    leaderboard = await _leaderboardService.GetWeeklyLeaderboard(playerId.Value);
+                else
+                    leaderboard = await _leaderboardService.GetMonthlyLeaderboard(playerId.Value);
+
+                await Clients.Caller.SendAsync("LeaderboardReceived", leaderboard);
             }
             catch (Exception ex)
             {
@@ -278,20 +261,28 @@ namespace ShutTheTwelve.Backend.Hubs
             }
         }
 
-        public async Task RequestRematch(int gameId)
+        public async Task CheckVersion(string clientVersion)
         {
-            await Clients.OthersInGroup($"Game_{gameId}").SendAsync("RematchRequested", GetUserId());
+            var currentVersion = "1.0.0"; // Get from config
+
+            if (clientVersion != currentVersion)
+            {
+                await Clients.Caller.SendAsync("ForceUpdate", currentVersion);
+            }
+            else
+            {
+                await Clients.Caller.SendAsync("VersionOk");
+            }
         }
 
-        public async Task AcceptRematch(int gameId)
+        private Guid? GetPlayerId()
         {
-            await Clients.Group($"Game_{gameId}").SendAsync("RematchAccepted");
-        }
-
-        public async Task Surrender(int gameId)
-        {
-            int playerId = GetUserId();
-            await Clients.Group($"Game_{gameId}").SendAsync("PlayerSurrendered", playerId);
+            var userIdClaim = Context.User?.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier);
+            if (userIdClaim != null && Guid.TryParse(userIdClaim.Value, out var userId))
+            {
+                return userId;
+            }
+            return null;
         }
     }
 }

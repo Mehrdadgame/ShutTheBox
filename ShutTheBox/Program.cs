@@ -1,91 +1,81 @@
+using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
-using ShutTheBox.Services;
-using ShutTheTwelve.Backend.Data;
-using ShutTheTwelve.Backend.Hubs;
-using ShutTheTwelve.Backend.Interfaces;
-using ShutTheTwelve.Backend.Services;
-using ShutTheTwelveBackend.Data;
-
-using System.Text;
+using ShutTheTwelveServer.Data;
+using ShutTheTwelveServer.Hubs;
+using ShutTheTwelveServer.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container
+// Add services
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-// Database Configuration
+// Database
 builder.Services.AddDbContext<GameDbContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
 
-// JWT Authentication
-var jwtKey = builder.Configuration["Jwt:Key"] ?? "YourSuperSecretKeyMinimum32Characters!!";
-var jwtIssuer = builder.Configuration["Jwt:Issuer"] ?? "ShutTheTwelveAPI";
-var jwtAudience = builder.Configuration["Jwt:Audience"] ?? "ShutTheTwelveClient";
-
-builder.Services.AddAuthentication(options =>
-{
-    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
-    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
-})
-.AddJwtBearer(options =>
-{
-    options.TokenValidationParameters = new TokenValidationParameters
+// Authentication
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
     {
-        ValidateIssuer = true,
-        ValidateAudience = true,
-        ValidateLifetime = true,
-        ValidateIssuerSigningKey = true,
-        ValidIssuer = jwtIssuer,
-        ValidAudience = jwtAudience,
-        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey))
-    };
-
-    // SignalR JWT Configuration
-    options.Events = new JwtBearerEvents
-    {
-        OnMessageReceived = context =>
+        options.TokenValidationParameters = new TokenValidationParameters
         {
-            var accessToken = context.Request.Query["access_token"];
-            var path = context.HttpContext.Request.Path;
-            if (!string.IsNullOrEmpty(accessToken) && path.StartsWithSegments("/gamehub"))
-            {
-                context.Token = accessToken;
-            }
-            return Task.CompletedTask;
-        }
-    };
-});
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(
+                Encoding.ASCII.GetBytes(builder.Configuration["Jwt:Secret"])),
+            ValidateIssuer = false,
+            ValidateAudience = false
+        };
 
-builder.Services.AddAuthorization();
+        // Support for SignalR
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                var accessToken = context.Request.Query["access_token"];
+                var path = context.HttpContext.Request.Path;
+                if (!string.IsNullOrEmpty(accessToken) && path.StartsWithSegments("/gameHub"))
+                {
+                    context.Token = accessToken;
+                }
+                return Task.CompletedTask;
+            }
+        };
+    });
 
 // SignalR
 builder.Services.AddSignalR();
 
-// CORS Policy
+// Services
+builder.Services.AddScoped<IAuthService, AuthService>();
+builder.Services.AddScoped<IGameService, GameService>();
+builder.Services.AddSingleton<IMatchmakingService, MatchmakingService>();
+builder.Services.AddSingleton<ILeaderboardService, LeaderboardService>();
+
+// Hosted Services
+builder.Services.AddHostedService<MatchmakingService>();
+builder.Services.AddHostedService<LeaderboardService>();
+
+// CORS
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("AllowAll", policy =>
+    options.AddPolicy("GamePolicy", policy =>
     {
-        policy.AllowAnyOrigin()
-              .AllowAnyMethod()
-              .AllowAnyHeader();
+        policy.WithOrigins(
+            "http://localhost:3000",
+            "https://yourgamedomain.com")
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials();
     });
 });
 
-// Register Services
-builder.Services.AddScoped<IAuthService, AuthService>();
-builder.Services.AddSingleton<IMatchmakingService, MatchmakingService>();
-builder.Services.AddScoped<IGameService, GameService>();
-builder.Services.AddScoped<IBotService, BotService>();
-builder.Services.AddScoped<IPowerCardService, PowerCardService>();
-
 var app = builder.Build();
 
-// Configure the HTTP request pipeline
+// Configure pipeline
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
@@ -93,19 +83,18 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
-app.UseCors("AllowAll");
-
+app.UseCors("GamePolicy");
 app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapControllers();
-app.MapHub<GameHub>("/gamehub");
+app.MapHub<GameHub>("/gameHub");
 
-// Database Migration
+// Initialize database
 using (var scope = app.Services.CreateScope())
 {
-    var db = scope.ServiceProvider.GetRequiredService<GameDbContext>();
-    db.Database.Migrate();
+    var context = scope.ServiceProvider.GetRequiredService<GameDbContext>();
+    context.Database.Migrate();
 }
 
 app.Run();

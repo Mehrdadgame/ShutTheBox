@@ -1,23 +1,30 @@
-﻿using Microsoft.EntityFrameworkCore;
-using Microsoft.IdentityModel.Tokens;
-using ShutTheBox.DTOs;
-using ShutTheBox.Models;
-using ShutTheTwelve.Backend.Data;
-using ShutTheTwelve.Backend.Interfaces;
-using ShutTheTwelve.Backend.Models;
-using ShutTheTwelveBackend.Data;
-using ShutTheTwelveBackend.Models;
+﻿using System;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
-using System.Security.Cryptography;
 using System.Text;
+using System.Threading.Tasks;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.IdentityModel.Tokens;
+using ShutTheTwelveServer.Data;
+using ShutTheTwelveServer.DTOs;
+using ShutTheTwelveServer.Models;
 
-namespace ShutTheTwelve.Backend.Services
+namespace ShutTheTwelveServer.Services
 {
+    public interface IAuthService
+    {
+        Task<AuthResponseDTO> Register(RegisterDTO dto);
+        Task<AuthResponseDTO> Login(LoginDTO dto);
+        string GenerateJwtToken(Player player);
+        bool CheckVersion(string clientVersion);
+    }
+
     public class AuthService : IAuthService
     {
         private readonly GameDbContext _context;
         private readonly IConfiguration _configuration;
+        private readonly string _currentVersion = "1.0.0";
 
         public AuthService(GameDbContext context, IConfiguration configuration)
         {
@@ -25,129 +32,113 @@ namespace ShutTheTwelve.Backend.Services
             _configuration = configuration;
         }
 
-        public async Task<AuthResponse> Register(RegisterRequest request)
+        public async Task<AuthResponseDTO> Register(RegisterDTO dto)
         {
-            // Check if username exists
+            // Check if user exists
             var existingUser = await _context.Players
-                .FirstOrDefaultAsync(p => p.Username == request.Username);
+                .FirstOrDefaultAsync(p => p.Username == dto.Username || p.Email == dto.Email);
 
             if (existingUser != null)
             {
-                return new AuthResponse
-                {
-                    Success = false,
-                    Message = "Username already exists"
-                };
+                throw new Exception("Username or email already exists");
             }
 
             // Create new player
             var player = new Player
             {
-                Username = request.Username,
-                PasswordHash = HashPassword(request.Password),
-                Power = 100,
-                Wins = 0,
-                Losses = 0,
+                Id = Guid.NewGuid(),
+                Username = dto.Username,
+                Email = dto.Email,
+                PasswordHash = BCrypt.Net.BCrypt.HashPassword(dto.Password),
+                ClientVersion = dto.ClientVersion,
                 CreatedAt = DateTime.UtcNow
             };
+
+            // Add default cards for new player
+            var defaultCards = await _context.PowerCards
+                .Where(c => c.Rarity == CardRarity.Common)
+                .ToListAsync();
+
+            foreach (var card in defaultCards)
+            {
+                player.PlayerCards.Add(new PlayerCard
+                {
+                    PlayerId = player.Id,
+                    PowerCardId = card.Id,
+                    Quantity = 1
+                });
+            }
 
             _context.Players.Add(player);
             await _context.SaveChangesAsync();
 
-            // Generate token
             var token = GenerateJwtToken(player);
+            var requiresUpdate = !CheckVersion(dto.ClientVersion);
 
-            return new AuthResponse
+            return new AuthResponseDTO
             {
-                Success = true,
-                Message = "Registration successful",
                 Token = token,
-                Player = new PlayerDto
-                {
-                    Id = player.Id,
-                    Username = player.Username,
-                    Power = player.Power,
-                    Wins = player.Wins,
-                    Losses = player.Losses
-                }
+                Username = player.Username,
+                Level = player.Level,
+                Experience = player.Experience,
+                RequiresUpdate = requiresUpdate,
+                LatestVersion = _currentVersion
             };
         }
 
-        public async Task<AuthResponse> Login(LoginRequest request)
+        public async Task<AuthResponseDTO> Login(LoginDTO dto)
         {
             var player = await _context.Players
-                .FirstOrDefaultAsync(p => p.Username == request.Username);
+                .FirstOrDefaultAsync(p => p.Username == dto.Username);
 
-            if (player == null || !VerifyPassword(request.Password, player.PasswordHash))
+            if (player == null || !BCrypt.Net.BCrypt.Verify(dto.Password, player.PasswordHash))
             {
-                return new AuthResponse
-                {
-                    Success = false,
-                    Message = "Invalid username or password"
-                };
+                throw new Exception("Invalid username or password");
             }
 
+            player.LastLoginAt = DateTime.UtcNow;
+            player.ClientVersion = dto.ClientVersion;
+            await _context.SaveChangesAsync();
+
             var token = GenerateJwtToken(player);
+            var requiresUpdate = !CheckVersion(dto.ClientVersion);
 
-            return new AuthResponse
+            return new AuthResponseDTO
             {
-                Success = true,
-                Message = "Login successful",
                 Token = token,
-                Player = new PlayerDto
-                {
-                    Id = player.Id,
-                    Username = player.Username,
-                    Power = player.Power,
-                    Wins = player.Wins,
-                    Losses = player.Losses
-                }
+                Username = player.Username,
+                Level = player.Level,
+                Experience = player.Experience,
+                RequiresUpdate = requiresUpdate,
+                LatestVersion = _currentVersion
             };
         }
 
-        public async Task<Player?> GetPlayerById(int id)
+        public string GenerateJwtToken(Player player)
         {
-            return await _context.Players.FindAsync(id);
-        }
-
-        private string HashPassword(string password)
-        {
-            using var sha256 = SHA256.Create();
-            var hashedBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(password));
-            return Convert.ToBase64String(hashedBytes);
-        }
-
-        private bool VerifyPassword(string password, string hashedPassword)
-        {
-            var hash = HashPassword(password);
-            return hash == hashedPassword;
-        }
-
-        private string GenerateJwtToken(Player player)
-        {
-            var jwtKey = _configuration["Jwt:Key"] ?? "YourSuperSecretKeyMinimum32Characters!!";
-            var jwtIssuer = _configuration["Jwt:Issuer"] ?? "ShutTheTwelveAPI";
-            var jwtAudience = _configuration["Jwt:Audience"] ?? "ShutTheTwelveClient";
-
-            var securityKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey));
-            var credentials = new SigningCredentials(securityKey, SecurityAlgorithms.HmacSha256);
-
-            var claims = new[]
+            var tokenHandler = new JwtSecurityTokenHandler();
+            var key = Encoding.ASCII.GetBytes(_configuration["Jwt:Secret"]);
+            var tokenDescriptor = new SecurityTokenDescriptor
             {
-                new Claim(ClaimTypes.NameIdentifier, player.Id.ToString()),
-                new Claim(ClaimTypes.Name, player.Username),
-                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
+                Subject = new ClaimsIdentity(new[]
+                {
+                    new Claim(ClaimTypes.NameIdentifier, player.Id.ToString()),
+                    new Claim(ClaimTypes.Name, player.Username),
+                    new Claim(ClaimTypes.Email, player.Email)
+                }),
+                Expires = DateTime.UtcNow.AddDays(7),
+                SigningCredentials = new SigningCredentials(
+                    new SymmetricSecurityKey(key),
+                    SecurityAlgorithms.HmacSha256Signature)
             };
 
-            var token = new JwtSecurityToken(
-                issuer: jwtIssuer,
-                audience: jwtAudience,
-                claims: claims,
-                expires: DateTime.UtcNow.AddDays(7),
-                signingCredentials: credentials
-            );
+            var token = tokenHandler.CreateToken(tokenDescriptor);
+            return tokenHandler.WriteToken(token);
+        }
 
-            return new JwtSecurityTokenHandler().WriteToken(token);
+        public bool CheckVersion(string clientVersion)
+        {
+            return clientVersion == _currentVersion;
         }
     }
 }

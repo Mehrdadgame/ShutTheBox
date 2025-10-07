@@ -1,26 +1,48 @@
-﻿using ShutTheTwelve.Backend.Enums;
+﻿using System;
 using System.ComponentModel.DataAnnotations;
 
-namespace ShutTheTwelve.Backend.Models
+namespace ShutTheTwelveServer.Models
 {
+    public enum CardType
+    {
+        LockAndReroll,
+        Sabotage,
+        SecondChance,
+        WildDice,
+        StealTurn,
+        Shield,
+        LightningRoll,
+        SwapBoard,
+        Mimic
+    }
+
+    public enum CardRarity
+    {
+        Common,
+        Rare,
+        Epic,
+        Legendary
+    }
+
     public class PowerCard
     {
         [Key]
         public int Id { get; set; }
 
         [Required]
-        [MaxLength(50)]
-        public string Name { get; set; } = string.Empty;
+        public string Name { get; set; }
 
-        [MaxLength(200)]
-        public string Description { get; set; } = string.Empty;
+        public string Description { get; set; }
 
-        public int Cost { get; set; }
+        public CardType Type { get; set; }
+        public CardRarity Rarity { get; set; }
 
-        [Required]
-        [MaxLength(50)]
-        public string EffectType { get; set; } = string.Empty; // LockAndReroll, Sabotage, etc.
+        public int PowerCost { get; set; }
+        public int UnlockLevel { get; set; } = 1;
 
+        public string IconUrl { get; set; }
         public bool IsActive { get; set; } = true;
+
+        public virtual ICollection<PlayerCard> PlayerCards { get; set; }
     }
 }
