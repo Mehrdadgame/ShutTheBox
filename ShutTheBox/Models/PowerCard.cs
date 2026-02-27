@@ -40,7 +40,9 @@ namespace ShutTheTwelveServer.Models
         public int PowerCost { get; set; }
         public int UnlockLevel { get; set; } = 1;
 
-        public string IconUrl { get; set; }
+        [Required]
+        public string IconUrl { get; set; } = string.Empty; // Fix: Initialize with a default value
+
         public bool IsActive { get; set; } = true;
 
         public virtual ICollection<PlayerCard> PlayerCards { get; set; }
